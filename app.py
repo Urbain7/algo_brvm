@@ -112,9 +112,7 @@ def main():
         # Tableau
         st.subheader("🔍 Analyse des Valeurs")
         st.dataframe(df[['Ticker', 'Prix', 'PER', 'Yield', 'Verdict_Score']]
-                     .sort_values('Verdict_Score', ascending=False)
-                     .style.background_gradient(subset=['Verdict_Score'], cmap='RdYlGn'))
-
+             .sort_values('Verdict_Score', ascending=False))
         # Graphique
         if df['Yield'].any():
             fig = px.scatter(df, x="PER", y="Yield", size="Prix", color="Ticker", title="Rendement vs PER")
