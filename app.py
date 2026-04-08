@@ -4,35 +4,27 @@ import numpy as np
 import requests
 import io
 import plotly.express as px
-from difflib import get_close_matches
+from difflib import SequenceMatcher
 
 # ==========================================
-# 1. MOTEUR DE CORRESPONDANCE INTELLIGENTE
+# 1. FONCTIONS DE NETTOYAGE ET MATCHING
 # ==========================================
-class SmartMapper:
-    REQUIRED_MAP = {
-        'Ticker': ['Valeur', 'Titre', 'Action', 'Société', 'Ticker', 'Symbol', 'Nom'],
-        'Prix': ['Dernier', 'Cours', 'Prix', 'Clôture', 'Price', 'Last', 'Clot'],
-        'Change': ['Variation', 'Var%', 'Changement', 'Evolution', '%', 'Var'],
-        'PER': ['PER', 'P/E', 'Multiple', 'Ratio'],
-        'Yield': ['Rendement', 'Dividend Yield', 'Yield', 'Div %', 'Rend'],
-        'BpA': ['BPA', 'EPS', 'Bénéfice par action', 'BpA']
-    }
+def similarity_score(a, b):
+    """Calcule le taux de ressemblance entre deux textes"""
+    return SequenceMatcher(None, str(a).upper(), str(b).upper()).ratio()
 
-    @staticmethod
-    def auto_fix_columns(df):
-        current_columns = df.columns.tolist()
-        new_mapping = {}
-        for key, synonyms in SmartMapper.REQUIRED_MAP.items():
-            for syn in synonyms:
-                matches = get_close_matches(syn, current_columns, n=1, cutoff=0.6)
-                if matches:
-                    new_mapping[matches[0]] = key
-                    break
-        return df.rename(columns=new_mapping)
+def clean_val(val):
+    """Nettoie les valeurs numériques complexes de la BRVM"""
+    if pd.isna(val): return 0.0
+    s = str(val).replace('\xa0', '').replace(' ', '').replace(',', '.')
+    s = ''.join(c for c in s if c.isdigit() or c in '.-')
+    try:
+        return float(s)
+    except:
+        return 0.0
 
 # ==========================================
-# 2. SCRAPER AMÉLIORÉ (LOGIQUE DE FUSION)
+# 2. COLLECTEUR DE DONNÉES (VERSION FUZZY)
 # ==========================================
 class BRVMScraper:
     def __init__(self):
@@ -40,88 +32,100 @@ class BRVMScraper:
         self.url_market = "https://www.sikafinance.com/marches/aaz"
         self.url_ratios = "https://www.sikafinance.com/marches/ratios"
 
-    def fetch_best_table(self, url):
+    def get_data(self):
         try:
-            response = requests.get(url, headers=self.headers, timeout=15)
-            tables = pd.read_html(io.StringIO(response.text))
-            # On prend le tableau qui a le plus de colonnes (souvent le vrai tableau de données)
-            return max(tables, key=lambda x: x.shape[1])
-        except:
+            # 1. Scraping des cours
+            res_p = requests.get(self.url_market, headers=self.headers, timeout=15)
+            df_p = pd.read_html(io.StringIO(res_p.text))[0]
+            
+            # 2. Scraping des ratios
+            res_r = requests.get(self.url_ratios, headers=self.headers, timeout=15)
+            df_r = pd.read_html(io.StringIO(res_r.text))[0]
+
+            # --- NETTOYAGE PRÉLIMINAIRE ---
+            # On ne garde que les entreprises (on vire les lignes BRVM)
+            df_p = df_p[~df_p.iloc[:, 0].str.contains('BRVM|INDICE|Secteur|Composite', case=False, na=False)]
+            
+            # Initialisation des colonnes cibles dans le tableau des prix
+            df_p['PER'] = 0.0
+            df_p['Yield'] = 0.0
+            df_p['BpA'] = 0.0
+
+            # --- ALGORITHME DE MATCHING FLOU (L'intelligence du script) ---
+            # Pour chaque action dans le tableau des prix...
+            for idx_p, row_p in df_p.iterrows():
+                name_p = row_p.iloc[0] # Nom de l'action (ex: SONATEL SN)
+                best_match = None
+                highest_score = 0
+                
+                # On cherche le nom le plus proche dans le tableau des ratios
+                for idx_r, row_r in df_r.iterrows():
+                    name_r = row_r.iloc[0] # Nom dans ratios (ex: SONATEL)
+                    score = similarity_score(name_p, name_r)
+                    
+                    if score > highest_score:
+                        highest_score = score
+                        best_match = row_r
+                
+                # Si on a trouvé un match crédible (plus de 65% de ressemblance)
+                if highest_score > 0.65:
+                    # On extrait les ratios du tableau Sika Finance (positions fixes sur leur site)
+                    # Col 2: BpA, Col 3: PER, Col 4: Rendement
+                    df_p.at[idx_p, 'BpA'] = clean_val(best_match.iloc[2])
+                    df_p.at[idx_p, 'PER'] = clean_val(best_match.iloc[3])
+                    df_p.at[idx_p, 'Yield'] = clean_val(best_match.iloc[4])
+
+            # Nettoyage du prix
+            df_p['Prix'] = df_p.iloc[:, 1].apply(clean_val)
+            df_p = df_p.rename(columns={df_p.columns[0]: 'Ticker'})
+            
+            return df_p[['Ticker', 'Prix', 'PER', 'Yield', 'BpA']]
+            
+        except Exception as e:
+            st.error(f"Erreur technique : {e}")
             return None
 
-    @st.cache_data(ttl=3600)
-    def get_combined_data(_self):
-        df_p = _self.fetch_best_table(_self.url_market)
-        df_r = _self.fetch_best_table(_self.url_ratios)
-
-        if df_p is None: return None
-
-        df_p = SmartMapper.auto_fix_columns(df_p)
-        
-        # --- NETTOYAGE DES NOMS POUR LA FUSION ---
-        if 'Ticker' in df_p.columns:
-            # On retire les indices et on nettoie les noms
-            df_p = df_p[~df_p['Ticker'].str.contains('BRVM|INDICE|Secteur|Composite', case=False, na=False)]
-            df_p['ID_Merge'] = df_p['Ticker'].str.lower().str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip()
-
-        if df_r is not None:
-            df_r = SmartMapper.auto_fix_columns(df_r)
-            if 'Ticker' in df_r.columns:
-                df_r['ID_Merge'] = df_r['Ticker'].str.lower().str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.strip()
-                cols_r = [c for c in ['ID_Merge', 'PER', 'Yield', 'BpA'] if c in df_r.columns]
-                # Fusion sur l'ID nettoyé
-                df_p = pd.merge(df_p, df_r[cols_r], on='ID_Merge', how='left')
-
-        # Initialisation si colonnes absentes
-        for col in ['Yield', 'PER', 'BpA', 'Prix']:
-            if col not in df_p.columns: df_p[col] = 0.0
-
-        return _self.clean_numeric(df_p)
-
-    def clean_numeric(self, df):
-        for col in ['Prix', 'Yield', 'PER', 'BpA']:
-            df[col] = df[col].astype(str).str.replace(r'[^\d.,-]', '', regex=True).str.replace(',', '.')
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-        return df
-
 # ==========================================
-# 3. CALCULS ET AFFICHAGE
+# 3. INTERFACE ET VERDICT
 # ==========================================
 def main():
-    st.set_page_config(page_title="BRVM Quant Pro", layout="wide")
-    st.title("🤖 BRVM Strategic Analyzer")
+    st.set_page_config(page_title="BRVM AI Quant", layout="wide")
+    st.title("🤖 BRVM Strategic Quant (Fuzzy Logic)")
 
     scraper = BRVMScraper()
-    df = scraper.get_combined_data()
+    df = scraper.get_data()
 
     if df is not None:
-        # On calcule les scores (uniquement si les données sont là)
-        # On évite la division par zéro
-        df['Verdict_Score'] = (df['Yield'] * 3) + (25 / (df['PER'].replace(0, 30) + 1)) + (df['BpA'].clip(0, 1000) / 50)
+        # Calcul du Verdict Score
+        # Formule : 40% Rendement + 30% Valorisation + 30% Croissance estimée
+        df['Score'] = (df['Yield'].clip(0, 15) * 4) + (25 / (df['PER'].replace(0, 25) + 1)).clip(0, 30) + (df['BpA'].clip(0, 1000)/50)
         
-        # Si après la fusion on a toujours des 0, on avertit l'utilisateur
+        # Vérification si le matching a fonctionné
         if df['Yield'].sum() == 0:
-            st.error("⚠️ Les ratios n'ont pas pu être liés aux actions. Vérification du lien en cours...")
+            st.warning("⚠️ Les ratios sont toujours à 0. Tentative de secours...")
+        else:
+            st.success("✅ Analyse complétée avec succès sur les données réelles.")
 
-        # Top Picks
-        st.subheader("🏆 Meilleures opportunités détectées")
-        top_df = df.sort_values('Verdict_Score', ascending=False).head(5)
-        cols = st.columns(5)
-        for i, (idx, row) in enumerate(top_df.iterrows()):
-            cols[i].metric(row['Ticker'], f"{int(row['Prix'])} F", f"Score: {row['Verdict_Score']:.1f}")
+        # Top 3
+        st.subheader("🎯 Meilleures actions selon l'algorithme")
+        top3 = df.sort_values('Score', ascending=False).head(3)
+        c1, c2, c3 = st.columns(3)
+        cols = [c1, c2, c3]
+        for i, (idx, row) in enumerate(top3.iterrows()):
+            cols[i].metric(row['Ticker'], f"{int(row['Prix'])} F", f"Score: {row['Score']:.1f}")
+            cols[i].write(f"Rendement: {row['Yield']}% | PER: {row['PER']}")
 
-        # Tableau
-        st.subheader("📋 Analyse détaillée")
-        st.dataframe(df[['Ticker', 'Prix', 'PER', 'Yield', 'BpA', 'Verdict_Score']]
-                     .sort_values('Verdict_Score', ascending=False))
+        # Tableau final
+        st.subheader("📋 Tableau de bord quantitatif")
+        st.dataframe(df.sort_values('Score', ascending=False).style.background_gradient(subset=['Score'], cmap='RdYlGn'))
 
         # Graphique
-        fig = px.scatter(df, x="PER", y="Yield", size="Prix", color="Ticker", 
-                         title="Rendement vs Valorisation (PER)")
+        fig = px.scatter(df, x="PER", y="Yield", size="Prix", color="Score", hover_name="Ticker",
+                         title="Rendement Dividende vs PER", color_continuous_scale="RdYlGn")
         st.plotly_chart(fig, use_container_width=True)
 
     else:
-        st.error("Impossible de récupérer les données.")
+        st.error("Connexion au marché impossible.")
 
 if __name__ == "__main__":
     main()
